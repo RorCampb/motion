@@ -1,4 +1,5 @@
 use thiserror::Error;
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Error)]
 pub enum MathError {
@@ -9,7 +10,7 @@ pub enum MathError {
     ZeroNorm,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VecN {
     pub data: Vec<f32>,
     pub norm: Option<f32>,
@@ -32,11 +33,7 @@ impl VecN {
     pub fn dim(&self) -> usize {
         self.data.len()
     }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
+    
     pub fn clear_cache(&mut self) {
         self.norm = None;
         self.normalized = None;
@@ -115,38 +112,4 @@ pub fn normalize_slice(a: &[f32]) -> Result<VecN, MathError> {
     Ok(v)
 }
 
-pub fn apply_kernel<F>(a: &[f32], mut f: F) -> Vec<f32>
-where
-    F: FnMut(f32) -> f32,
-{
-    a.iter().copied().map(|x| f(x)).collect()
-}
 
-pub fn apply_kernel2<F>(a: &[f32], b: &[f32], mut f: F) -> Result<Vec<f32>, MathError>
-where
-    F: FnMut(f32, f32) -> f32,
-{
-    if a.len() != b.len() {
-        return Err(MathError::DimensionMismatch {
-            left: a.len(),
-            right: b.len(),
-        });
-    }
-
-    Ok(a.iter()
-        .copied()
-        .zip(b.iter().copied())
-        .map(|(x, y)| f(x, y))
-        .collect())
-}
-
-pub fn apply_kernel_indexed<F>(a: &[f32], mut f: F) -> Vec<f32>
-where
-    F: FnMut(usize, f32) -> f32,
-{
-    a.iter()
-        .copied()
-        .enumerate()
-        .map(|(i, x)| f(i, x))
-        .collect()
-}

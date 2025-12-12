@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{Sender, Receiver};
 use thiserror::Error;
 
-use crate::math::{apply_kernel2, MathError, VecN};
+use crate::embedding::embed_post;
+use crate::math::{MathError, VecN};
+use crate::kernel::{apply_kernel2, Kernel};
+use crate::motion_input::{MotionInput};
+
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -13,6 +18,9 @@ pub enum CoreError {
 
     #[error("math error: {0}")]
     Math(#[from] MathError), 
+   
+    #[error("channel closed while sending motion entry")]
+    ChannelError
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -23,10 +31,14 @@ pub struct MotionUser {
 }
 
 impl MotionUser {
-    pub fn new(id: String, coord: VecN) -> Self {
-        let mut c = coord.clone();
-        let m = c.norm();
-        Self { id, coord, motion: m }
+    pub fn new(id: impl Into<String>, dim: usize) -> Self {
+        let coord = VecN::new(vec![0.0; dim]);
+        let motion = 0.0;
+        Self {
+            id: id.into(),
+            coord,
+            motion,
+        }
     }
 }
 
@@ -74,13 +86,20 @@ impl MotionEntry {
 pub struct MotionSpace {
     pub dim: usize,
     pub entries: Vec<MotionEntry>,
+    pub kernel: Kernel,
 }
 
 impl MotionSpace {
     pub fn new(dim: usize) -> Self {
+        let default_kernel = Kernel::RBF { gamma: 0.5 };
+        Self::new_with_kernel(dim, default_kernel)
+    }
+
+    pub fn new_with_kernel(dim: usize, kernel: Kernel) -> Self {
         Self {
             dim,
             entries: Vec::new(),
+            kernel,
         }
     }
 
@@ -88,6 +107,48 @@ impl MotionSpace {
         self.entries.push(entry);
     }
     
+    pub async fn core_loop(&mut self, mut rx: Receiver<MotionInput>, tx: Sender<MotionEntry>) -> Result<(), CoreError> {
+        while let Some(input) = rx.recv().await {
+            match input {
+                MotionInput::Post(post) => {
+                    let embedding: VecN = embed_post(&post.text);
+
+                    let motion_post = MotionPost::new(
+                        post.id.clone(),
+                        embedding,
+                    );
+
+                    let entry = MotionEntry::Post(motion_post);
+
+                    self.enter(entry.clone());
+                    match self.apply_post_to_user(&post.user_id, &post.id, 0.5) {
+                        Ok(()) => println!("post application successful for {:?}", entry),
+                        Err(e) => {
+                            eprintln!("post application error: {}", e);
+                            return Err(e);
+                        }
+                    }
+
+                    tx.send(entry)
+                        .await
+                        .map_err(|_| CoreError::ChannelError)?;
+                }
+                MotionInput::User(user) => {
+                    let motion_user = MotionUser::new(&user.id, self.dim);
+
+                    let entry = MotionEntry::User(motion_user);
+
+                    self.enter(entry.clone());
+                    tx.send(entry)
+                        .await
+                        .map_err(|_| CoreError::ChannelError)?;
+                }
+            }
+        }
+        Ok(())
+    }    
+
+
     pub fn apply_post_to_user(
         &mut self,
         user_id: &str,
@@ -118,8 +179,12 @@ impl MotionSpace {
             (u.coord.data.clone(), p.coord.data.clone())
         };
 
-        let new_data =
-            apply_kernel2(&user_data, &post_data, |u, p| u * (1.0 - alpha) + p * alpha)?;
+        let similarity = self.kernel.apply(&user_data, &post_data)?;
+        let weight = (alpha * similarity).clamp(0.0, 1.0);
+
+        let new_data = apply_kernel2(&user_data, &post_data, |u, p| {
+            u * (1.0 - weight) + p * weight
+        })?;
 
         let mut new_coord = VecN::new(new_data);
         let new_motion = new_coord.norm();
