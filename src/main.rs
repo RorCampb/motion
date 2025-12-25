@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 fn log_entry(entry: &MotionEntry) {
     match entry {
         MotionEntry::User(u) => {
-            println!("User [{}] motion {:.4} coord {:?}", u.id, u.motion, u.coord.data);
+            println!("User [{}]  coord {:?}", u.id, u.coord.data);
         }
         MotionEntry::Post(p) => {
             println!("Post [{}] coord {:?}", p.id, p.coord.data);

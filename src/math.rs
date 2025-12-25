@@ -64,10 +64,12 @@ impl VecN {
         }
 
         let inv = 1.0 / n;
-        let x: Vec<f32> = self.data.iter().map(|v| v * inv).collect();
+        for v in &mut self.data {
+            *v *= inv;
+        } 
 
-        self.normalized = Some(x);
-        Ok(self.normalized.as_ref().unwrap())
+        self.normalized = None;
+        Ok(&self.data)
     }
 }
 

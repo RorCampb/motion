@@ -39,10 +39,25 @@ impl UserInput {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum InteractionType {
+    PostToUser,
+    UserToUser,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Interaction {
+    pub interaction_type: InteractionType, 
+    pub src_id: String,
+    pub dst_id: String,
+    pub alpha: f32,
+}
+
 pub enum MotionInput {
     User(UserInput),
     Post(PostInput),
+    Interaction(Interaction),
 }
+
 impl MotionInput {
     pub async fn input_loop(tx: Sender<MotionInput>) -> Result<(), InputError> {
         use tokio::io::{self, AsyncBufReadExt};
