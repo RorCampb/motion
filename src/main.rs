@@ -9,7 +9,7 @@ mod motion_input;
 use tokio::sync::mpsc;
 
 use crate::embedding::EMBEDDING_DIM;
-use crate::motion_core::{MotionEntry, MotionSpace};
+use crate::motion_core::{MotionEntry, MotionOutput, MotionSpace};
 use crate::motion_input::MotionInput;
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Channel from stdin loop -> core loop
     let (input_tx, input_rx) = mpsc::channel::<MotionInput>(64);
     // Channel from core loop -> logger
-    let (entry_tx, mut entry_rx) = mpsc::channel::<MotionEntry>(64);
+    let (entry_tx, mut entry_rx) = mpsc::channel::<MotionOutput>(64);
 
     // Spawn the input loop (stdin driven)
     let input_handle = tokio::spawn(async move {
@@ -35,8 +35,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Log entries as they are produced
-    while let Some(entry) = entry_rx.recv().await {
-        log_entry(&entry);
+    while let Some(output) = entry_rx.recv().await {
+        log_output(&output);
     }
 
     // Ensure tasks complete (they may already be done if channels closed)
@@ -46,10 +46,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn log_output(output: &MotionOutput) {
+    match output {
+        MotionOutput::Entered(entry) | MotionOutput::Updated(entry) => log_entry(entry),
+        MotionOutput::InteractionApplied(result) => {
+            println!(
+                "Interaction {} -> {}  weight {:.4}  sim {:.4}",
+                result.src_id, result.dst_id, result.weight, result.similarity
+            );
+        }
+    };
+}
+
 fn log_entry(entry: &MotionEntry) {
     match entry {
         MotionEntry::User(u) => {
-            println!("User [{}]  coord {:?}", u.id, u.coord.data);
+            let coord = u.coord.as_ref().map(|c| &c.data);
+            println!("User [{}]  coord {:?}", u.id, coord);
         }
         MotionEntry::Post(p) => {
             println!("Post [{}] coord {:?}", p.id, p.coord.data);

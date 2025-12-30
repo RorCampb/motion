@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::embedding::embed_post;
 use crate::math::{MathError, VecN};
 use crate::kernel::{apply_kernel2, Kernel};
-use crate::motion_input::{MotionInput, Interaction};
+use crate::motion_input::{MotionInput, Interaction, InteractionType};
 
 
 #[derive(Debug, Error)]
@@ -36,7 +36,7 @@ pub struct MotionUser {
 }
 
 impl MotionUser {
-    pub fn new(id: impl Into<String>, dim: usize) -> Self {
+    pub fn new(id: impl Into<String>, _dim: usize) -> Self {
         let motion = 0.0;
         Self {
             id: id.into(),
@@ -76,15 +76,22 @@ impl MotionEntry {
             MotionEntry::Post(p) => &p.id,
         }
     }
-
-    pub fn coord(&mut self) -> &mut VecN {
-        match self {
-            MotionEntry::User(u) => &mut u.coord,
-            MotionEntry::Post(p) => &mut p.coord,
-        }
-    }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InteractionResult {
+    pub src_id: String,
+    pub dst_id: String,
+    pub weight: f32,
+    pub similarity: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum MotionOutput {
+    Entered(MotionEntry),
+    Updated(MotionEntry),
+    InteractionApplied(InteractionResult) 
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MotionSpace {
@@ -95,11 +102,7 @@ pub struct MotionSpace {
 
 impl MotionSpace {
     pub fn new(dim: usize) -> Self {
-        let default_kernel = Kernel::RBF { gamma: 2.0 };
-        Self::new_with_kernel(dim, default_kernel)
-    }
-
-    pub fn new_with_kernel(dim: usize, kernel: Kernel) -> Self {
+        let kernel = Kernel::RBF { gamma: 2.0 };
         Self {
             dim,
             entries: Vec::new(),
@@ -117,7 +120,7 @@ impl MotionSpace {
         actor_id: &str,
         target_id: &str,
         alpha: f32,
-    ) -> Result<(), CoreError> {
+    ) -> Result<InteractionResult, CoreError> {
         let actor_idx = self
             .entries
             .iter()
@@ -134,11 +137,11 @@ impl MotionSpace {
             let a = match &self.entries[actor_idx] {
                 MotionEntry::User(u) => u,
                 _ => unreachable!("actor idx must point to a user"),
-            }
+            };
             let t = match &self.entries[target_idx] {
                 MotionEntry::User(u) => u,
                 _ => unreachable!("target idx must point to a user"),
-            }
+            };
             let actor_coord = a.coord.as_ref().ok_or_else(|| CoreError::CoordNotLoaded {
                 user_id: actor_id.to_string(),
             })?;
@@ -156,7 +159,7 @@ impl MotionSpace {
         let similarity = self.kernel.apply(&actor_data, &target_data)?;
         let weight = 1.0 - (-alpha * similarity).exp();
         
-        step = 0.5 * weight;
+        let step = 0.5 * weight;
         
         let new_actor_data = apply_kernel2(&actor_data, &target_data, |a, t| a * (1.0 - step) + t * step)?;
         let new_target_data = apply_kernel2(&target_data, &actor_data, |t, a| t * (1.0 - step) + a * step)?;
@@ -170,8 +173,8 @@ impl MotionSpace {
         let gain_target = 1.0;
         let gain_actor = 0.5;
         
-        let new_target_motion = (1.0 - decay) * u.motion + gain_target * weight;
-        let new_actor_motion = (1.0 - decay) * u.motion + gain_actor * weight;
+        let new_target_motion = (1.0 - decay) * target_motion + gain_target * weight;
+        let new_actor_motion = (1.0 - decay) * actor_motion + gain_actor * weight;
         
         if let MotionEntry::User(u) = &mut self.entries[target_idx] {
             u.coord = Some(new_target_coord);
@@ -183,7 +186,12 @@ impl MotionSpace {
         }
         
         println!("sim={:.4} weight={:.4} actor motion={:.4} target motion={:.4}", similarity, weight, new_actor_motion, new_target_motion);
-        Ok(())
+        Ok(InteractionResult {
+            src_id: actor_id.to_string(),
+            dst_id: target_id.to_string(),
+            weight,
+            similarity,
+        })
     }
 
     pub fn apply_post_to_user(
@@ -191,13 +199,7 @@ impl MotionSpace {
         user_id: &str,
         post_id: &str,
         alpha: f32,
-    ) -> Result<(), CoreError> {
-        let user_idx = self
-            .entries
-            .iter()
-            .position(|e| matches!(e, MotionEntry::User(u) if u.id == user_id))
-            .ok_or_else(|| CoreError::UserNotFound { user_id: user_id.to_string() })?;
-
+    ) -> Result<InteractionResult, CoreError> {
         let post_idx = self
             .entries
             .iter()
@@ -208,7 +210,19 @@ impl MotionSpace {
             MotionEntry::Post(p) => p.coord.clone(),
             _ => unreachable!("post idx must point to a post"),
         };
-        let user_coord = match &self.entries[user_idx] {
+        let user_idx = match self
+            .entries
+            .iter()
+            .position(|e| matches!(e, MotionEntry::User(u) if u.id == user_id))
+        {
+            Some(idx) => idx,
+            None => {
+                let motion_user = MotionUser::new(user_id, self.dim);
+                self.entries.push(MotionEntry::User(motion_user));
+                self.entries.len() - 1
+            }
+        };
+        let user_coord = match &mut self.entries[user_idx] {
             MotionEntry::User(u) => u.coord.get_or_insert_with(|| post_coord.clone()),
             _ => unreachable!("user idx must point to a user"),
         };
@@ -233,56 +247,63 @@ impl MotionSpace {
         if let MotionEntry::User(u) = &mut self.entries[user_idx] {
             let new_motion = (1.0 - decay) * u.motion + gain * weight;
 
-            u.coord = new_coord;
+            u.coord = Some(new_coord);
             u.motion = new_motion;
             println!("sim={:.4} weight={:.4} motion={:.4}", similarity, weight, u.motion);
         }
 
-        Ok(())
+        Ok(InteractionResult {
+            src_id: post_id.to_string(),
+            dst_id: user_id.to_string(),
+            weight,
+            similarity,
+        })
     }
 
-    pub fn apply_interaction(&mut self, interaction: Interaction) -> Result<(), CoreError> {
+    pub fn apply_interaction(&mut self, interaction: Interaction) -> Result<InteractionResult, CoreError> {
         match interaction.interaction_type {
             InteractionType::PostToUser => {
-                let post_id = &interaction.src_id;
-                let user_id = &interaction.dst_id;
-                
-                self.apply_post_to_user(user_id, post_id, interaction.alpha)?;
+                self.apply_post_to_user(&interaction.dst_id, &interaction.src_id, interaction.alpha)
             },
             InteractionType::UserToUser => {
-                let actor_id = &interaction.src_id;
-                let target_id = &interaction.dst_id;
-                
-                self.apply_user_to_user(actor_id, target_id, interaction.alpha)?;
+                self.apply_user_to_user(&interaction.src_id, &interaction.dst_id, interaction.alpha)
             },
         }
-        Ok(())
     }
 
-    pub async fn core_loop(&mut self, mut rx: Receiver<MotionInput>, tx: Sender<MotionEntry>) -> Result<(), CoreError> {
+    pub async fn core_loop(&mut self, mut rx: Receiver<MotionInput>, tx: Sender<MotionOutput>) -> Result<(), CoreError> {
         while let Some(input) = rx.recv().await {
             match input {
                 MotionInput::Post(post) => {
                     let embedding: VecN = embed_post(&post.text);
-
                     let motion_post = MotionPost::new(
                         post.id.clone(),
                         embedding,
                     );
 
                     let entry = MotionEntry::Post(motion_post);
-
                     self.enter(entry.clone());
-                    
-                    match self.apply_post_to_user(&post.user_id, &post.id, 0.5) {
-                        Ok(()) => println!("post application successful for {:?}", entry),
-                        Err(e) => {
-                            eprintln!("post application error: {}", e);
-                            return Err(e);
-                        }
+                    tx.send(MotionOutput::Entered(entry))
+                        .await
+                        .map_err(|_| CoreError::ChannelError)?;
+                   
+                    if self.entries.iter().all(|e| !matches!(e, MotionEntry::User(u) if u.id == post.user_id)) {
+                        let motion_user = MotionUser::new(&post.user_id, self.dim);
+                        let user_entry = MotionEntry::User(motion_user);
+                        self.enter(user_entry.clone());
+                        tx.send(MotionOutput::Entered(user_entry))
+                            .await
+                            .map_err(|_| CoreError::ChannelError)?;
                     }
 
-                    tx.send(entry)
+                    let interaction = Interaction {
+                        interaction_type: InteractionType::PostToUser, 
+                        src_id: post.id.clone(),
+                        dst_id: post.user_id.clone(),
+                        alpha: 0.5,
+                    };
+                    let res = self.apply_interaction(interaction)?;
+                    tx.send(MotionOutput::InteractionApplied(res))
                         .await
                         .map_err(|_| CoreError::ChannelError)?;
                 }
@@ -292,17 +313,18 @@ impl MotionSpace {
                     let entry = MotionEntry::User(motion_user);
 
                     self.enter(entry.clone());
-                    tx.send(entry)
+                    tx.send(MotionOutput::Entered(entry))
                         .await
                         .map_err(|_| CoreError::ChannelError)?;
                 }
                 MotionInput::Interaction(interaction) => {
-                    self.apply_interaction(interaction)?; 
+                    let res = self.apply_interaction(interaction)?; 
+                    tx.send(MotionOutput::InteractionApplied(res))
+                        .await
+                        .map_err(|_| CoreError::ChannelError)?; 
                 }
             }
         }
         Ok(())
     }    
-
-    
 }

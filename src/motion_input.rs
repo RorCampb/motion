@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
 use thiserror::Error;
 use chrono::Utc;
+use std::collections::HashSet;
 
 #[derive(Debug, Error)]
 pub enum InputError {
@@ -66,17 +67,41 @@ impl MotionInput {
         let mut lines = stdin.lines();
         
         let mut current_user: Option<String> = None;
+        let mut known_users: HashSet<String> = HashSet::new();
+
+        async fn ensure_user(
+            tx: &Sender<MotionInput>,
+            known: &mut HashSet<String>,
+            user_id: &str,
+        ) -> Result<(), InputError> {
+            if known.insert(user_id.to_string()) {
+                let user = UserInput::new(user_id);
+                tx.send(MotionInput::User(user))
+                    .await
+                    .map_err(|_| InputError::ChannelError)?;
+            }
+            Ok(())
+        }
+
+        async fn send_post(
+            tx: &Sender<MotionInput>,
+            user_id: &str,
+            text: &str,
+        ) -> Result<(), InputError> {
+            let post_id = format!("post-{}", Utc::now().timestamp_millis());
+            let post = PostInput::new(post_id, user_id, text);
+            tx.send(MotionInput::Post(post))
+                .await
+                .map_err(|_| InputError::ChannelError)?;
+            Ok(())
+        }
+
+        println!("Commands: u <id>, s <id>, p <text>, i post <post_id> <user_id> [alpha], i user <src_id> <dst_id> [alpha], q");
 
         loop {
-            println!();
-            println!("=== Motion Input ===");
-            println!("1. New User");
-            println!("2. New Post (for current user)");
-            println!("3. Switch Current User");
-            println!("q. Quit");
             print!("> ");
 
-            let Some(choice) = lines
+            let Some(line) = lines
                 .next_line()
                 .await
                 .map_err(|_| InputError::InvalidInput)?
@@ -84,106 +109,122 @@ impl MotionInput {
                 break;
             };
 
-            let choice = choice.trim();
-
-            match choice {
-                "1" => {
-                    println!("Enter new user id:");
-                    let Some(id) = lines
-                        .next_line()
-                        .await
-                        .map_err(|_| InputError::InvalidInput)?
-                    else {
-                        break;
-                    };
-                    let id = id.trim().to_string();
-                    if id.is_empty() {
-                        println!("Cannot accept empty user id");
-                        continue;
-                    }
-
-                    let user = UserInput::new(id.clone());
-                    current_user = Some(id.clone());
-
-                    tx.send(MotionInput::User(user))
-                        .await
-                        .map_err(|_| InputError::ChannelError)?;
-                    println!("Created and switched to user: {}", id);
-                }
-
-                "2" => {
-                    let user_id = match &current_user {
-                        Some(id) => id.clone(),
-                        None => {
-                            println!("No current user...");
-                            continue;
-                        }
-                    };
-
-                    println!("Write a post: ");
-                    let Some(text) = lines
-                        .next_line()
-                        .await
-                        .map_err(|_| InputError::InvalidInput)?
-                    else {
-                        break;
-                    };
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        println!("Post cannot be empty");
-                        continue;
-                    }
-                    let post_id = format!("post-{}", Utc::now().timestamp_millis());
-                    let post = PostInput::new(
-                        post_id,
-                        user_id.clone(),
-                        text
-                    );
-                    tx.send(MotionInput::Post(post))
-                        .await
-                        .map_err(|_| InputError::ChannelError)?;
-                    println!("Posted as user: {}", user_id);
-                }
-                "3" => {
-                    println!("Enter user id to switch to:");
-                    let Some(id) = lines
-                        .next_line()
-                        .await
-                        .map_err(|_| InputError::InvalidInput)?
-                    else {
-                        break;
-                    };
-                    let id = id.trim().to_string();
-                    if id.is_empty() {
-                        println!("Cannot accept empty user id");
-                        continue;
-                    }
-                    current_user = Some(id.clone());
-                    println!("Switched to user: {}", id);
-                }
-                "q" | "Q" => break,
-                _ => {
-                    println!("Unrecognized choice.");
-                }
-            }
-        }
-        while let Some(line) = lines.next_line().await.map_err(|_| InputError::InvalidInput)? {
             let line = line.trim();
             if line.is_empty() {
-                continue; 
+                continue;
             }
-            
-            let (user_id, text) = match line.split_once(':') {
-                Some((id, msg)) => (id.trim(), msg.trim()),
-                None => ("default", line),
-            };
-            
-            let post_id = format!("post-{}", Utc::now().timestamp_millis());
+            if line.eq_ignore_ascii_case("q") {
+                break;
+            }
 
-            let post = PostInput::new(post_id, user_id, text);
-            tx.send(MotionInput::Post(post))
-                .await
-                .map_err(|_| InputError::ChannelError)?;
+            let mut parts = line.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+
+            match cmd {
+                "u" | "s" => {
+                    let Some(id) = parts.next() else {
+                        println!("Usage: {} <id>", cmd);
+                        continue;
+                    };
+                    if id.is_empty() {
+                        println!("Cannot accept empty user id");
+                        continue;
+                    }
+                    ensure_user(&tx, &mut known_users, id).await?;
+                    current_user = Some(id.to_string());
+                    println!("Current user: {}", id);
+                }
+                "p" => {
+                    let text = line.strip_prefix("p").unwrap_or("").trim();
+                    if text.is_empty() {
+                        println!("Usage: p <text>");
+                        continue;
+                    }
+                    let Some(user_id) = current_user.as_ref() else {
+                        println!("No current user...");
+                        continue;
+                    };
+                    ensure_user(&tx, &mut known_users, user_id).await?;
+                    send_post(&tx, user_id, text).await?;
+                    println!("Posted as user: {}", user_id);
+                }
+                "i" => {
+                    let Some(kind) = parts.next() else {
+                        println!("Usage: i post|user ...");
+                        continue;
+                    };
+                    match kind {
+                        "post" => {
+                            let Some(post_id) = parts.next() else {
+                                println!("Usage: i post <post_id> <user_id> [alpha]");
+                                continue;
+                            };
+                            let Some(user_id) = parts.next() else {
+                                println!("Usage: i post <post_id> <user_id> [alpha]");
+                                continue;
+                            };
+                            let alpha = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+                            ensure_user(&tx, &mut known_users, user_id).await?;
+                            tx.send(MotionInput::Interaction(Interaction {
+                                interaction_type: InteractionType::PostToUser,
+                                src_id: post_id.to_string(),
+                                dst_id: user_id.to_string(),
+                                alpha,
+                            }))
+                            .await
+                            .map_err(|_| InputError::ChannelError)?;
+                        }
+                        "user" => {
+                            let Some(src_id) = parts.next() else {
+                                println!("Usage: i user <src_id> <dst_id> [alpha]");
+                                continue;
+                            };
+                            let Some(dst_id) = parts.next() else {
+                                println!("Usage: i user <src_id> <dst_id> [alpha]");
+                                continue;
+                            };
+                            let alpha = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+                            ensure_user(&tx, &mut known_users, src_id).await?;
+                            ensure_user(&tx, &mut known_users, dst_id).await?;
+                            tx.send(MotionInput::Interaction(Interaction {
+                                interaction_type: InteractionType::UserToUser,
+                                src_id: src_id.to_string(),
+                                dst_id: dst_id.to_string(),
+                                alpha,
+                            }))
+                            .await
+                            .map_err(|_| InputError::ChannelError)?;
+                        }
+                        _ => {
+                            println!("Usage: i post|user ...");
+                        }
+                    }
+                }
+                "?" | "help" => {
+                    println!("Commands: u <id>, s <id>, p <text>, i post <post_id> <user_id> [alpha], i user <src_id> <dst_id> [alpha], q");
+                }
+                _ => {
+                    if let Some((user_id, text)) = line.split_once(':') {
+                        let user_id = user_id.trim();
+                        let text = text.trim();
+                        if user_id.is_empty() || text.is_empty() {
+                            println!("Usage: <user_id>: <text>");
+                            continue;
+                        }
+                        ensure_user(&tx, &mut known_users, user_id).await?;
+                        send_post(&tx, user_id, text).await?;
+                        println!("Posted as user: {}", user_id);
+                    } else {
+                        let Some(user_id) = current_user.as_ref() else {
+                            println!("No current user...");
+                            continue;
+                        };
+                        ensure_user(&tx, &mut known_users, user_id).await?;
+                        send_post(&tx, user_id, line).await?;
+                        println!("Posted as user: {}", user_id);
+                    }
+                }
+            }
         }
         Ok(())
     }
